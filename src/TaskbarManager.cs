@@ -23,6 +23,11 @@ namespace DesktopGlassDock
         private static readonly string StatusPath = Path.Combine(Files.Data, "taskbar-status.json");
         private DispatcherTimer timer;
         private ShellTaskbars.RevealHook revealHook;
+        private DesktopVisibility.StartMenuHook startMenuHook;
+        private DispatcherTimer transitionTimer;
+        private readonly StartTransitionWindow transition = new StartTransitionWindow();
+        private StartTransitionStatus transitionStatus = new StartTransitionStatus();
+        private bool refreshing;
         private TaskbarBackup backup;
         private bool started;
         private bool enabled;
@@ -33,6 +38,7 @@ namespace DesktopGlassDock
         private bool disposed;
         private string lastError = "";
         private string lastStatus = "";
+        private string lastStartIdentityError = "";
 
         public bool IsHiding { get { return enabled && restorePending && !temporarilyShownForStartMenu; } }
 
@@ -55,6 +61,8 @@ namespace DesktopGlassDock
                 timer.Tick += OnTick;
                 timer.Start();
                 revealHook = new ShellTaskbars.RevealHook(OnTaskbarRevealed);
+                try { startMenuHook = new DesktopVisibility.StartMenuHook(Dispatcher.CurrentDispatcher, BeginShellTransition); }
+                catch (Exception ex) { Files.Log("开始菜单快速监听未启用，保留周期确认。", ex); }
                 PersistStatus();
             }
             catch (Exception ex)
@@ -107,6 +115,8 @@ namespace DesktopGlassDock
                 BackupExists = File.Exists(BackupPath),
                 AllTaskbarsHidden = windows.Count > 0 && windows.All(x => !x.Visible),
                 RevealHookActive = revealHook != null && revealHook.Active,
+                StartMenuHookActive = startMenuHook != null && startMenuHook.Active,
+                StartMenuTransition = transitionStatus,
                 TemporarilyShownForStartMenu = temporarilyShownForStartMenu,
                 StartMenu = startMenu,
                 AppBarState = state,
@@ -193,17 +203,91 @@ namespace DesktopGlassDock
             return result;
         }
 
-        public void RefreshForShellUi()
+        internal static long MonotonicMilliseconds()
         {
-            OnTick(null, EventArgs.Empty);
+            return (long)(Stopwatch.GetTimestamp() * (1000.0 / Stopwatch.Frequency));
         }
 
-        private void OnTick(object sender, EventArgs args)
+        public void RefreshForShellUi()
         {
             if (!enabled || disposed) return;
+            long received = MonotonicMilliseconds();
+            bool candidate;
+            try
+            {
+                candidate = DesktopVisibility.IsTrustedStartEventWindow(Native.GetForegroundWindow());
+                lastStartIdentityError = "";
+            }
+            catch (Exception ex)
+            {
+                string error = ex.GetType().FullName + ":" + ex.Message;
+                if (lastStartIdentityError != error)
+                    Files.Log("开始菜单前台身份查询失败，继续周期确认。", ex);
+                lastStartIdentityError = error;
+                RefreshState();
+                return;
+            }
+            if (candidate || temporarilyShownForStartMenu)
+                BeginShellTransition(candidate ? "开始菜单前台过渡" : "开始菜单离开前台", received, candidate);
+            else RefreshState();
+        }
+
+        private void BeginShellTransition(string trigger, long received, bool expectedOpen)
+        {
+            if (!enabled || disposed) return;
+            bool fresh = !transition.Active || transition.ExpectedOpen != expectedOpen;
+            transition.Begin(received, expectedOpen);
+            if (fresh)
+                transitionStatus = new StartTransitionStatus { Trigger = trigger, ExpectedOpen = expectedOpen, Active = true, Outcome = "短时确认中" };
+            // 第一轮由 Send 事件直接执行；开始动画还没完成时才用有界短计时器继续确认。
+            RefreshState();
+            if (!transition.Active || !enabled || disposed) return;
+            if (transitionTimer == null)
+            {
+                transitionTimer = new DispatcherTimer(DispatcherPriority.Input);
+                transitionTimer.Interval = TimeSpan.FromMilliseconds(20);
+                transitionTimer.Tick += OnTransitionTick;
+            }
+            transitionTimer.Start();
+        }
+
+        private void OnTransitionTick(object sender, EventArgs args)
+        {
+            if (!enabled || disposed) { StopTransitionTimer(); return; }
+            if (transitionTimer == null) return;
+            RefreshState(!transition.TakeTick(MonotonicMilliseconds()));
+        }
+
+        private void OnTick(object sender, EventArgs args) { RefreshState(); }
+
+        private void RefreshState(bool transitionExpired = false)
+        {
+            if (!enabled || disposed || refreshing) return;
+            refreshing = true;
             try
             {
                 ApplyHidden();
+                if (transitionExpired)
+                    FinishTransition(false, "短时确认结束，保留慢周期校验", ShellTaskbars.Enumerate());
+                else if (transition.Active)
+                {
+                    List<TaskbarWindow> windows = ShellTaskbars.Enumerate();
+                    bool hasMain = windows.Any(x => x.ClassName == MainClass);
+                    bool confirmed = hasMain && (transition.ExpectedOpen
+                        ? windows.All(x => x.Visible && InsideMonitor(x.Rect, x.MonitorRect))
+                        : windows.All(x => !x.Visible));
+                    bool expectedState = startMenu.IsOpen == transition.ExpectedOpen;
+                    if (expectedState && confirmed)
+                    {
+                        transition.Observe(startMenu.IsOpen, true);
+                        FinishTransition(true, "原生窗口状态已确认", windows);
+                    }
+                    else if (MonotonicMilliseconds() - transition.StartedAt >= 200)
+                    {
+                        transition.Cancel();
+                        FinishTransition(false, "短时确认结束，保留慢周期校验", windows);
+                    }
+                }
                 if (lastError.Length > 0) lastError = "";
                 PersistStatus();
             }
@@ -218,6 +302,36 @@ namespace DesktopGlassDock
                 Files.Log("任务栏隐藏已停止：" + lastError, ex);
                 PersistStatus();
             }
+            finally { refreshing = false; }
+        }
+
+        private void FinishTransition(bool confirmed, string outcome, List<TaskbarWindow> windows)
+        {
+            transitionStatus.Active = false;
+            transitionStatus.Outcome = outcome;
+            transitionStatus.ConfirmationWindowMilliseconds = Math.Max(0, MonotonicMilliseconds() - transition.StartedAt);
+            // 这是事件回调到原生可见位/屏内边界的确认耗时，不是屏幕像素绘制完成时间。
+            transitionStatus.HookCallbackToNativeConfirmationMilliseconds = confirmed ? transitionStatus.ConfirmationWindowMilliseconds : (long?)null;
+            transitionStatus.NativeTaskbarsVisible = windows.Count > 0 && windows.All(x => x.Visible);
+            transitionStatus.NativeTaskbarsFullyOnScreen = windows.Count > 0 && windows.All(x => InsideMonitor(x.Rect, x.MonitorRect));
+            StopTransitionTimer();
+        }
+
+        private void StopTransitionTimer()
+        {
+            transition.Cancel();
+            if (transitionTimer == null) return;
+            transitionTimer.Stop();
+            transitionTimer.Tick -= OnTransitionTick;
+            transitionTimer = null;
+        }
+
+        private sealed class StartTransitionStatus
+        {
+            public string Trigger = "", Outcome = "尚无开始菜单过渡";
+            public bool ExpectedOpen, Active, NativeTaskbarsVisible, NativeTaskbarsFullyOnScreen;
+            public long? HookCallbackToNativeConfirmationMilliseconds;
+            public long ConfirmationWindowMilliseconds;
         }
 
         private void ApplyHidden()
@@ -284,6 +398,9 @@ namespace DesktopGlassDock
         private void StopTimer()
         {
             // 必须先注销显示事件，再恢复任务栏，避免恢复请求被本工具再次隐藏。
+            if (startMenuHook != null) { startMenuHook.Dispose(); startMenuHook = null; }
+            StopTransitionTimer();
+            transitionStatus.Active = false;
             if (revealHook != null) { revealHook.Dispose(); revealHook = null; }
             if (timer == null) return;
             timer.Stop();
@@ -430,6 +547,83 @@ namespace DesktopGlassDock
         }
 
 
+        // 原生事件与 UI 调度之间的边界，回归测试可用队列替换消息循环。
+        internal sealed class StartEventRouter : IDisposable
+        {
+            private readonly Func<IntPtr, bool> trusted;
+            private readonly Action<Action> schedule;
+            private readonly Action<string, long, bool> refresh;
+            private readonly Func<long> clock;
+            private bool queued, dispatching, disposed, expectedOpen;
+            private long receivedAt;
+            private string trigger;
+            internal StartEventRouter(Func<IntPtr, bool> trusted, Action<Action> schedule,
+                Action<string, long, bool> refresh, Func<long> clock)
+            {
+                this.trusted = trusted; this.schedule = schedule; this.refresh = refresh; this.clock = clock;
+            }
+            internal void Notify(uint eventType, IntPtr window, int objectId, int childId)
+            {
+                if (disposed || dispatching || window == IntPtr.Zero || objectId != 0 || childId != 0) return;
+                string nextTrigger;
+                switch (eventType)
+                {
+                    case 0x8002: nextTrigger = "开始菜单显示事件"; break;
+                    case 0x8003: nextTrigger = "开始菜单隐藏事件"; break;
+                    case 0x8017: nextTrigger = "开始菜单cloak事件"; break;
+                    case 0x8018: nextTrigger = "开始菜单解除cloak事件"; break;
+                    default: return;
+                }
+                long received = clock();
+                // 这里验证身份而不要求已经可见；是否真正展开仍交给严格的 CaptureStartMenu。
+                if (!trusted(window)) return;
+                expectedOpen = eventType == 0x8002 || eventType == 0x8018;
+                trigger = nextTrigger;
+                if (queued) return;
+                receivedAt = received;
+                queued = true;
+                try
+                {
+                    schedule(delegate
+                    {
+                        queued = false;
+                        if (disposed || dispatching) return;
+                        dispatching = true;
+                        try { refresh(trigger, receivedAt, expectedOpen); }
+                        finally { dispatching = false; }
+                    });
+                }
+                catch { queued = false; throw; }
+            }
+            public void Dispose() { disposed = true; queued = false; }
+        }
+
+        internal sealed class StartTransitionWindow
+        {
+            internal bool Active { get; private set; }
+            internal bool ExpectedOpen { get; private set; }
+            internal long StartedAt { get; private set; }
+            private int ticks;
+            internal void Begin(long now, bool expectedOpen)
+            {
+                // 同方向事件不刷新起点，避免事件风暴让短周期永久运行。
+                if (Active && ExpectedOpen == expectedOpen) return;
+                Active = true; ExpectedOpen = expectedOpen; StartedAt = now; ticks = 0;
+            }
+            internal bool TakeTick(long now)
+            {
+                if (!Active) return false;
+                if (now - StartedAt >= 200 || ticks >= 10) { Active = false; return false; }
+                ticks++;
+                return true;
+            }
+            internal void Observe(bool actualOpen, bool confirmed)
+            {
+                if (Active && actualOpen == ExpectedOpen && confirmed) Active = false;
+            }
+            internal void Cancel() { Active = false; }
+        }
+
         // 不读取或改变系统的纯逻辑检查，可并入主程序的隔离自检。
         public static object SelfTest()
         {
@@ -493,6 +687,54 @@ namespace DesktopGlassDock
             checks["原生类同名但非当前Explorer拒绝"] = !directResult.Any(x => x.Handle == spoofedTaskbar);
             checks["当前Explorer其他窗口不当任务栏操作"] = !directResult.Any(x => x.Handle == unrelatedWindow);
             checks["没有已验证Explorer不操作任何任务栏"] = ShellTaskbars.CollectTaskbars(directClasses, 0, handle => fixture[handle]).Count == 0;
+
+            var pending = new Queue<Action>();
+            int refreshed = 0;
+            long eventClock = 0, firstObserved = -1;
+            bool requestedOpen = false;
+            var router = new StartEventRouter(handle => handle == realTaskbar, pending.Enqueue,
+                delegate(string trigger, long received, bool expectedOpen) { refreshed++; firstObserved = received; requestedOpen = expectedOpen; }, () => eventClock);
+            router.Notify(0x8018, realTaskbar, 0, 0);
+            if (pending.Count > 0) pending.Dequeue()();
+            checks["可信开始菜单解除cloak无需等慢周期"] = refreshed == 1 && firstObserved == 0 && requestedOpen;
+            router.Notify(0x8018, spoofedTaskbar, 0, 0);
+            router.Notify(0x8002, realTaskbar, -4, 0);
+            router.Notify(0x8005, realTaskbar, 0, 0);
+            checks["无关身份子对象及其他事件不触发刷新"] = pending.Count == 0 && refreshed == 1;
+            eventClock = 10;
+            router.Notify(0x8002, realTaskbar, 0, 0);
+            eventClock = 15;
+            router.Notify(0x8018, realTaskbar, 0, 0);
+            checks["开始菜单事件风暴只排队一次"] = pending.Count == 1;
+            if (pending.Count > 0) pending.Dequeue()();
+            checks["合并事件保留最早计时起点"] = refreshed == 2 && firstObserved == 10;
+            router.Notify(0x8017, realTaskbar, 0, 0);
+            if (pending.Count > 0) pending.Dequeue()();
+            checks["开始菜单cloak及时请求隐藏"] = refreshed == 3 && !requestedOpen;
+            router.Notify(0x8002, realTaskbar, 0, 0);
+            router.Dispose();
+            while (pending.Count > 0) pending.Dequeue()();
+            router.Notify(0x8018, realTaskbar, 0, 0);
+            checks["退出后已排队及新事件都不操作任务栏"] = refreshed == 3 && pending.Count == 0;
+
+            var transition = new StartTransitionWindow();
+            transition.Begin(0, true);
+            int fastTicks = 0;
+            for (int index = 1; index <= 20; index++) if (transition.TakeTick(index * 10)) fastTicks++;
+            checks["无法确认时短周期最多十次"] = fastTicks == 10 && !transition.Active;
+            transition.Begin(1000, true);
+            transition.Begin(1150, true);
+            checks["事件风暴不延长二百毫秒确认窗口"] = !transition.TakeTick(1200) && !transition.Active;
+            transition.Begin(2000, true);
+            transition.Observe(false, true);
+            checks["开始动画尚未展开时继续短确认"] = transition.Active;
+            transition.Observe(true, true);
+            checks["真实可见且屏内后立即收敛回慢周期"] = !transition.Active;
+            transition.Begin(3000, false);
+            transition.Observe(false, false);
+            checks["异步显隐尚未确认时不提前停止"] = transition.Active;
+            transition.Cancel();
+            checks["停止时清理过渡确认"] = !transition.TakeTick(3020) && !transition.Active;
 
             return new { Passed = checks.Values.All(x => x), Count = checks.Count, Checks = checks };
         }

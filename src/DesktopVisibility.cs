@@ -88,6 +88,42 @@ namespace DesktopGlassDock
         {
             return coreWindow && trustedExecutable && currentSession && visible && usableBounds && knownUncloaked && supportedRoot;
         }
+        private static bool TrustedStartIdentity(IntPtr window)
+        {
+            if (window == IntPtr.Zero || ClassOf(window) != "Windows.UI.Core.CoreWindow") return false;
+            IntPtr root = GetAncestor(window, 2);
+            if (!SupportedStartRoot(root == window, ClassOf(root))) return false;
+            uint process;
+            if (Native.GetWindowThreadProcessId(window, out process) == 0 || process == 0 || !InCurrentSession(process)) return false;
+            string expected = Path.Combine(WindowsPath, @"SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe");
+            return String.Equals(Native.ProcessPath(window), expected, StringComparison.OrdinalIgnoreCase);
+        }
+        // SHOW/UNCLOAK 事件经常早于最终可见位；只提前识别原厂身份，不提前宣布菜单已经打开。
+        internal static bool IsTrustedStartEventWindow(IntPtr window)
+        {
+            if (TrustedStartIdentity(window)) return true;
+            if (window == IntPtr.Zero || ClassOf(window) != "ImmersiveLauncher") return false;
+            var queue = new Queue<KeyValuePair<IntPtr, int>>();
+            var visited = new HashSet<IntPtr>();
+            queue.Enqueue(new KeyValuePair<IntPtr, int>(window, 0));
+            int count = 0;
+            while (queue.Count > 0 && count++ < 256)
+            {
+                KeyValuePair<IntPtr, int> item = queue.Dequeue();
+                if (!visited.Add(item.Key)) continue;
+                if (TrustedStartIdentity(item.Key)) return true;
+                if (item.Value >= 8) continue;
+                IntPtr child = IntPtr.Zero;
+                for (int index = 0; index < 128 && queue.Count < 256; index++)
+                {
+                    child = FindWindowEx(item.Key, child, null, null);
+                    if (child == IntPtr.Zero) break;
+                    queue.Enqueue(new KeyValuePair<IntPtr, int>(child, item.Value + 1));
+                }
+            }
+            return false;
+        }
+
         private static bool TryStartCandidate(IntPtr window, string source, StartMenuSnapshot result)
         {
             if (ClassOf(window) != "Windows.UI.Core.CoreWindow" || !Native.IsWindowVisible(window)) return false;
@@ -187,6 +223,56 @@ namespace DesktopGlassDock
 
             return new { Passed = checks.Values.All(x => x), Count = checks.Count, Checks = checks, LiveForeground = Capture(), LiveStartMenuOpen = IsStartMenuOpen(),
                 Limitations = new[] { "纯逻辑测试未注入鼠标键盘；桌面显示、软件隐藏和开始菜单任务栏须在真实会话验收。" } };
+        }
+
+        internal sealed class StartMenuHook : IDisposable
+        {
+            private delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr window, int objectId, int childId, uint thread, uint time);
+            [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetWinEventHook(uint minimum, uint maximum, IntPtr module, WinEventProc callback, uint process, uint thread, uint flags);
+            [DllImport("user32.dll")] private static extern bool UnhookWinEvent(IntPtr hook);
+            private readonly WinEventProc callback;
+            private readonly List<IntPtr> handles = new List<IntPtr>();
+            private readonly TaskbarManager.StartEventRouter router;
+            private GCHandle callbackRoot;
+            private bool disposed;
+            internal bool Active { get { return !disposed && handles.Count > 0; } }
+            internal StartMenuHook(Dispatcher dispatcher, Action<string, long, bool> changed)
+            {
+                router = new TaskbarManager.StartEventRouter(IsTrustedStartEventWindow,
+                    action => dispatcher.BeginInvoke(DispatcherPriority.Send, action), changed, TaskbarManager.MonotonicMilliseconds);
+                callback = delegate(IntPtr hook, uint eventType, IntPtr window, int objectId, int childId, uint thread, uint time)
+                {
+                    if (disposed || dispatcher.HasShutdownStarted) return;
+                    try { router.Notify(eventType, window, objectId, childId); }
+                    catch (Exception ex) { Files.Log("开始菜单显示事件处理失败，继续使用周期确认。", ex); }
+                };
+                callbackRoot = GCHandle.Alloc(callback);
+                try
+                {
+                    // WINEVENT_OUTOFCONTEXT：不注入系统进程；两个小范围只接收显示/隐藏与 cloak 变化。
+                    foreach (uint minimum in new uint[] { 0x8002, 0x8017 })
+                    {
+                        IntPtr handle = SetWinEventHook(minimum, minimum + 1, IntPtr.Zero, callback, 0, 0, 0);
+                        if (handle == IntPtr.Zero)
+                            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "开始菜单显示监听注册失败");
+                        handles.Add(handle);
+                    }
+                }
+                catch { Dispose(); throw; }
+            }
+            public void Dispose()
+            {
+                if (disposed) return;
+                disposed = true;
+                router.Dispose();
+                bool allReleased = true;
+                foreach (IntPtr handle in handles)
+                    if (!UnhookWinEvent(handle)) allReleased = false;
+                handles.Clear();
+                if (allReleased) { if (callbackRoot.IsAllocated) callbackRoot.Free(); }
+                else Files.Log("开始菜单监听注销失败，已停用处理并保留回调引用。", null);
+                GC.KeepAlive(callback);
+            }
         }
 
         internal sealed class ForegroundHook : IDisposable
