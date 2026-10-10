@@ -1,0 +1,54 @@
+﻿# 本机应用清单可能含用户名、安装目录与快捷方式路径，首次初始化生成。
+/apps.json
+/dock.json
+
+# 用户排序、运行窗口标题、自启动和任务栏备份全部留在本机。
+/data/
+/assets/
+
+# 编译输出与开发工具状态。
+*.exe
+*.dll
+*.pdb
+*.map
+/bin/
+/obj/
+/build/
+/.vs/
+/.vscode/
+/.idea/
+
+# 临时文件、缓存、日志和私密配置。
+*.tmp
+*.writing-*
+*.log
+/.tmp/
+/.tmp-*/
+/.cache/
+.env
+.env.*
+# 无网络配置需求，发布前整理记录与空环境说明只保留在本机。
+/FORK_REPORT.md
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account.json
+/.secrets/
+/secrets/
+/sessions/
+/.Codex/
+
+# 不发布桌面截图、录屏、个人素材和配置备份。
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.mp4
+*.mkv
+*.avi
+*.reg
+/备份/
+/验收/
