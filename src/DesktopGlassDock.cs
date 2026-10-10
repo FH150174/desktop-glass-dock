@@ -779,6 +779,7 @@ namespace DesktopGlassDock
         }
         private IntPtr Hook(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam, ref bool handled)
         {
+            if (msg == 0x0046) DesktopLayer.FilterPosition(hwnd, lparam);
             if (msg == Native.WM_MOUSEACTIVATE) { handled = true; return new IntPtr(3); }
             if (msg == Native.WM_HOTKEY && wparam.ToInt32() == 0x4450) { owner.ToggleLaunchpad(); handled = true; }
             if (msg == Native.WM_DPICHANGED) Dispatcher.BeginInvoke(new Action(owner.PositionWindows));
@@ -1161,7 +1162,8 @@ namespace DesktopGlassDock
         private string runningSnapshotKey = "";
         private DateTime lastRunningError = DateTime.MinValue;
         private DesktopVisibility.ForegroundHook foregroundHook;
-        private bool lastExternalWasDesktop, visibilityWriteFailed;
+        private DesktopLayer desktopLayer;
+        private bool visibilityWriteFailed;
         private string lastVisibilityState = "";
         private bool exiting;
         public bool HotkeyAvailable;
@@ -1204,6 +1206,7 @@ namespace DesktopGlassDock
                 Files.Log("隐藏 Windows 任务栏失败。", ex);
             }
             new WindowInteropHelper(Dock).EnsureHandle();
+            desktopLayer = new DesktopLayer(Dock.Handle, () => Dock.NativeGlassHandle);
             UpdateVisibility();
             try { foregroundHook = new DesktopVisibility.ForegroundHook(Application.Current.Dispatcher, delegate { if (taskbar != null) taskbar.RefreshForShellUi(); UpdateVisibility(); }); }
             catch (Exception ex) { Files.Log("前台监听未启用，继续使用周期校验。", ex); }
@@ -1268,16 +1271,28 @@ namespace DesktopGlassDock
         {
             if (exiting) return;
             DesktopVisibility.Snapshot foreground = DesktopVisibility.Capture();
-            bool show = DesktopVisibility.Decide(foreground.HasForeground, foreground.OwnWindow, foreground.ValidatedDesktop, lastExternalWasDesktop);
-            if (!foreground.OwnWindow) lastExternalWasDesktop = foreground.HasForeground && foreground.ValidatedDesktop;
-            // Dock 和玻璃底层均不置顶；软件、开始菜单或未知窗口前台时一起隐藏。
-            if (show && !Dock.IsVisible) Dock.Show();
-            else if (!show && Dock.IsVisible) Dock.Hide();
+            // 前台仅用于诊断；Dock 常驻桌面层，让应用按实际窗口范围自然覆盖。
+            bool show = DesktopVisibility.Decide(foreground.HasForeground, foreground.OwnWindow, foreground.ValidatedDesktop, false);
+            try
+            {
+                if (desktopLayer != null && (!Dock.IsVisible || Dock.WindowState == WindowState.Minimized))
+                    desktopLayer.Refresh();
+                if (Dock.WindowState == WindowState.Minimized || Native.IsIconic(Dock.Handle)) Dock.WindowState = WindowState.Normal;
+                if (show && !Dock.IsVisible) Dock.Show();
+                if (desktopLayer != null) desktopLayer.Refresh();
+            }
+            catch (Exception ex)
+            {
+                if (desktopLayer != null) desktopLayer.RecordError("桌面层排列失败，保留当前位置并等待再次确认。", ex);
+                else Files.Log("桌面层尚未初始化。", ex);
+            }
             IntPtr glass = Dock.NativeGlassHandle;
             var state = new
             {
-                Mode = "DesktopOnly", foreground.ForegroundHandle, foreground.ForegroundProcessId, foreground.ForegroundClass,
-                foreground.ValidatedDesktop, foreground.Reason, LastExternalWasDesktop = lastExternalWasDesktop,
+                Mode = "DesktopLayer", foreground.ForegroundHandle, foreground.ForegroundProcessId, foreground.ForegroundClass,
+                foreground.ValidatedDesktop, ForegroundReason = foreground.Reason,
+                VisibilityReason = "常驻桌面层，由普通应用窗口自然遮挡；前台变化不隐藏 Dock",
+                Layer = desktopLayer == null ? null : desktopLayer.Status(),
                 DockVisible = Dock.IsVisible, DockTopmost = Dock.Topmost,
                 DockBackdropVisible = glass != IntPtr.Zero && Native.IsWindowVisible(glass),
                 DockBackdropTopmost = glass != IntPtr.Zero && (Native.GetWindowLong(glass, Native.GWL_EXSTYLE) & 8) != 0,
@@ -1370,6 +1385,7 @@ namespace DesktopGlassDock
             try
             {
                 if (visibilityTimer != null) visibilityTimer.Stop(); if (runningTimer != null) runningTimer.Stop(); SystemEvents.DisplaySettingsChanged -= DisplayChanged;
+                if (desktopLayer != null) { desktopLayer.Dispose(); desktopLayer = null; }
                 Launchpad.Close(); Dock.Close();
             }
             finally

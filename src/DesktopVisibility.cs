@@ -30,8 +30,8 @@ namespace DesktopGlassDock
         }
         internal static bool Decide(bool hasForeground, bool ownWindow, bool validatedDesktop, bool lastExternalWasDesktop)
         {
-            if (!hasForeground) return false;
-            return ownWindow ? lastExternalWasDesktop : validatedDesktop;
+            // 前台状态不再控制 Dock 可见性；真实遮挡交给 DesktopLayer 的窗口层级。
+            return true;
         }
         private static string ClassOf(IntPtr window)
         {
@@ -59,7 +59,7 @@ namespace DesktopGlassDock
                 result.ForegroundProcessId = process;
                 result.ForegroundClass = ClassOf(foreground);
                 result.OwnWindow = process == OwnProcess;
-                if (result.OwnWindow) { result.Reason = "本工具窗口保持上一外部状态"; return result; }
+                if (result.OwnWindow) { result.Reason = "本工具窗口前台，仅记录诊断，不改变桌面层"; return result; }
                 IntPtr shell = GetShellWindow();
                 uint shellProcess = 0;
                 if (shell != IntPtr.Zero) Native.GetWindowThreadProcessId(shell, out shellProcess);
@@ -207,13 +207,13 @@ namespace DesktopGlassDock
             checks["真实 Progman 桌面显示"] = Decide(true, false, true, false);
             checks["真实 WorkerW 桌面显示"] = Decide(true, false, true, false);
             foreach (string name in new[] { "普通小窗", "最大化软件", "全屏软件", "副屏软件", "Explorer 文件夹", "Windows 开始菜单", "伪造桌面类", "身份查询失败" })
-                checks[name + "前台隐藏"] = !Decide(true, false, false, true);
+                checks[name + "前台仍常驻桌面层"] = Decide(true, false, false, true);
             checks["Dock 自身点击保持桌面显示"] = Decide(true, true, false, true);
-            checks["自身菜单不把隐藏 Dock 带到软件上"] = !Decide(true, true, false, false);
-            checks["显式启动台不把隐藏 Dock 带到软件上"] = !Decide(true, true, false, false);
-            checks["无前台窗口保守隐藏"] = !Decide(false, false, false, true);
-            checks["无前台时不保留旧的自身状态"] = !Decide(false, true, false, true);
-            checks["拖动或底边不参与显示判定"] = !Decide(true, false, false, true);
+            checks["自身菜单保持 Dock 常驻但不提升层级"] = Decide(true, true, false, false);
+            checks["显式启动台保持 Dock 常驻但不提升层级"] = Decide(true, true, false, false);
+            checks["无前台窗口时仍常驻桌面层"] = Decide(false, false, false, true);
+            checks["无前台时自身状态不影响常驻"] = Decide(false, true, false, true);
+            checks["拖动或底边不改变常驻策略"] = Decide(true, false, false, true);
             checks["原生开始菜单顶层窗口可识别"] = StartCandidateAccepted(true, true, true, true, true, true, SupportedStartRoot(true, "Windows.UI.Core.CoreWindow"));
             checks["原生开始菜单宿主内子窗口可识别"] = StartCandidateAccepted(true, true, true, true, true, true, SupportedStartRoot(false, "ImmersiveLauncher"));
             checks["仅进程存在而窗口关闭不显示任务栏"] = !StartCandidateAccepted(true, true, true, false, true, true, true);
@@ -221,8 +221,9 @@ namespace DesktopGlassDock
             checks["伪造窗口类或程序路径不能显示任务栏"] = !StartCandidateAccepted(true, false, true, true, true, true, true) && !StartCandidateAccepted(false, true, true, true, true, true, true);
             checks["其他会话或未知宿主不能显示任务栏"] = !StartCandidateAccepted(true, true, false, true, true, true, true) && !StartCandidateAccepted(true, true, true, true, true, true, SupportedStartRoot(false, "伪造宿主"));
 
+            foreach (var check in DesktopLayer.RegressionChecks()) checks[check.Key] = check.Value;
             return new { Passed = checks.Values.All(x => x), Count = checks.Count, Checks = checks, LiveForeground = Capture(), LiveStartMenuOpen = IsStartMenuOpen(),
-                Limitations = new[] { "纯逻辑测试未注入鼠标键盘；桌面显示、软件隐藏和开始菜单任务栏须在真实会话验收。" } };
+                Limitations = new[] { "纯逻辑测试未注入鼠标键盘；自然遮挡、露出区域点击和开始菜单任务栏须在真实会话验收。" } };
         }
 
         internal sealed class StartMenuHook : IDisposable

@@ -398,6 +398,7 @@ namespace DesktopGlassDock
 
         private static IntPtr BackdropMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam)
         {
+            if (message == 0x0046) DesktopLayer.FilterPosition(hwnd, lParam);
             if (message == 0x0084) return new IntPtr(-1); // HTTRANSPARENT，同线程主窗口正常接收输入。
             if (message == 0x0021) return new IntPtr(3); // MA_NOACTIVATE。
             if (message == 0x0014) return new IntPtr(1); // DWM 合成背景，不填充实心黑色。
