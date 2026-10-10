@@ -29,6 +29,7 @@ namespace DesktopGlassDock
         private bool configured;
         private bool restorePending;
         private bool temporarilyShownForStartMenu;
+        private DesktopVisibility.StartMenuSnapshot startMenu = new DesktopVisibility.StartMenuSnapshot();
         private bool disposed;
         private string lastError = "";
         private string lastStatus = "";
@@ -107,6 +108,7 @@ namespace DesktopGlassDock
                 AllTaskbarsHidden = windows.Count > 0 && windows.All(x => !x.Visible),
                 RevealHookActive = revealHook != null && revealHook.Active,
                 TemporarilyShownForStartMenu = temporarilyShownForStartMenu,
+                StartMenu = startMenu,
                 AppBarState = state,
                 Error = lastError,
                 Taskbars = windows.Select(x => x.Snapshot()).ToArray()
@@ -147,6 +149,7 @@ namespace DesktopGlassDock
                 AllTaskbarsHidden = windows.Count > 0 && windows.All(x => !x.Visible),
                 AppBarState = state,
                 Taskbars = windows.Select(x => x.Snapshot()).ToArray(),
+                StartMenu = DesktopVisibility.CaptureStartMenu(),
                 Error = String.Join("；", errors)
             };
         }
@@ -219,6 +222,9 @@ namespace DesktopGlassDock
 
         private void ApplyHidden()
         {
+            // 即使 Explorer 临时没有任务栏，也更新开始菜单诊断，不能沿用上次隐藏状态。
+            startMenu = DesktopVisibility.CaptureStartMenu();
+            temporarilyShownForStartMenu = startMenu.IsOpen;
             List<TaskbarWindow> windows = ShellTaskbars.Enumerate();
             TaskbarWindow main = windows.FirstOrDefault(x => x.ClassName == MainClass);
             // Explorer 登录/重启间隙没有主任务栏时只等待，不对其他窗口或系统设置操作。
@@ -239,13 +245,19 @@ namespace DesktopGlassDock
             }
             uint state = ShellTaskbars.GetState();
             restorePending = true;
-            temporarilyShownForStartMenu = DesktopVisibility.IsStartMenuOpen();
             if (temporarilyShownForStartMenu)
             {
                 // 仅在真实开始菜单打开期间显示原生任务栏，不改用户隐藏偏好。
                 uint visibleState = state & ~AutoHide;
                 if (state != visibleState) ShellTaskbars.SetState(main, visibleState);
-                foreach (TaskbarWindow window in windows) ShellTaskbars.SetVisible(window, true);
+                // Explorer 在清除自动隐藏后可能重新布局，必须读取新边界再校正。
+                foreach (TaskbarWindow window in ShellTaskbars.Enumerate())
+                {
+                    TaskbarWindowState saved = backup.Windows.FirstOrDefault(x => x.ClassName == window.ClassName &&
+                        String.Equals(x.MonitorDevice, window.MonitorDevice, StringComparison.OrdinalIgnoreCase));
+                    ShellTaskbars.EnsureFullyOnScreen(window, saved);
+                    ShellTaskbars.SetVisible(window, true);
+                }
                 return;
             }
             if ((state & AutoHide) == 0)
@@ -346,15 +358,24 @@ namespace DesktopGlassDock
                 TaskbarWindow main = windows.FirstOrDefault(x => x.ClassName == MainClass);
                 if (main == null) throw new InvalidOperationException("当前没有可验证的 Explorer 主任务栏，请在 Explorer 恢复后再次执行恢复。");
                 ShellTaskbars.SetState(main, saved.AppBarState);
-                foreach (TaskbarWindow window in windows)
+                foreach (TaskbarWindow window in ShellTaskbars.Enumerate())
+                {
+                    if ((saved.AppBarState & AutoHide) == 0 && OriginalVisibility(saved, window))
+                    {
+                        TaskbarWindowState original = saved.Windows.FirstOrDefault(x => x.ClassName == window.ClassName &&
+                            String.Equals(x.MonitorDevice, window.MonitorDevice, StringComparison.OrdinalIgnoreCase));
+                        ShellTaskbars.EnsureFullyOnScreen(window, original);
+                    }
                     ShellTaskbars.SetVisible(window, OriginalVisibility(saved, window));
+                }
                 // ShowWindowAsync 返回的是已提交请求，需另外确认实际可见位而非把返回值当最终结果。
                 for (int attempt = 0; attempt < 12; attempt++)
                 {
                     windows = ShellTaskbars.Enumerate();
                     main = windows.FirstOrDefault(x => x.ClassName == MainClass);
                     if (main != null && ShellTaskbars.GetState() == saved.AppBarState &&
-                        windows.All(x => x.Visible == OriginalVisibility(saved, x)))
+                        windows.All(x => x.Visible == OriginalVisibility(saved, x) &&
+                            ((saved.AppBarState & AutoHide) != 0 || !x.Visible || InsideMonitor(x.Rect, x.MonitorRect))))
                     {
                         result.Success = true;
                         result.AppBarState = ShellTaskbars.GetState();
@@ -368,6 +389,46 @@ namespace DesktopGlassDock
             catch (Exception ex) { result.Error = ex.Message; Files.Log("恢复系统任务栏失败。", ex); }
             return result;
         }
+
+        // 自动隐藏会把整个父任务栏推到屏外；只修正溢出的父窗口，不单独移动托盘或时钟。
+        private static bool InsideMonitor(WinRect rect, WinRect monitor)
+        {
+            return rect.Right > rect.Left && rect.Bottom > rect.Top && rect.Left >= monitor.Left &&
+                rect.Top >= monitor.Top && rect.Right <= monitor.Right && rect.Bottom <= monitor.Bottom;
+        }
+        private static WinRect FullTaskbarBounds(WinRect current, WinRect monitor, WinRect? saved)
+        {
+            if (InsideMonitor(current, monitor)) return current;
+            int width = current.Right - current.Left, height = current.Bottom - current.Top;
+            int monitorWidth = monitor.Right - monitor.Left, monitorHeight = monitor.Bottom - monitor.Top;
+            if (monitorWidth <= 0 || monitorHeight <= 0) throw new InvalidDataException("显示器边界无效，未移动任务栏。");
+            if (saved.HasValue && (width <= 0 || height <= 0 || width > monitorWidth || height > monitorHeight))
+            {
+                WinRect previous = saved.Value;
+                int previousWidth = previous.Right - previous.Left, previousHeight = previous.Bottom - previous.Top;
+                if (previousWidth > 0 && previousHeight > 0 && previousWidth <= monitorWidth && previousHeight <= monitorHeight)
+                { width = previousWidth; height = previousHeight; }
+            }
+            if (width <= 0 || height <= 0) throw new InvalidDataException("任务栏尺寸无效，未移动其他窗口。");
+            width = Math.Min(width, monitorWidth); height = Math.Min(height, monitorHeight);
+            int left = Math.Max(monitor.Left, Math.Min(current.Left, monitor.Right - width));
+            int top = Math.Max(monitor.Top, Math.Min(current.Top, monitor.Bottom - height));
+            // 横栏只沿上/下边修正，竖栏只沿左/右边修正；负坐标和不同 DPI 使用实际物理边界。
+            if (width >= height)
+                top = Math.Abs((long)current.Top - monitor.Top) <= Math.Abs((long)current.Bottom - monitor.Bottom) ? monitor.Top : monitor.Bottom - height;
+            else
+                left = Math.Abs((long)current.Left - monitor.Left) <= Math.Abs((long)current.Right - monitor.Right) ? monitor.Left : monitor.Right - width;
+            return new WinRect { Left = left, Top = top, Right = left + width, Bottom = top + height };
+        }
+        private static TaskbarBounds BoundsOf(WinRect rect)
+        {
+            return new TaskbarBounds { Left = rect.Left, Top = rect.Top, Right = rect.Right, Bottom = rect.Bottom };
+        }
+        private static bool SameBounds(WinRect first, WinRect second)
+        {
+            return first.Left == second.Left && first.Top == second.Top && first.Right == second.Right && first.Bottom == second.Bottom;
+        }
+
 
         // 不读取或改变系统的纯逻辑检查，可并入主程序的隔离自检。
         public static object SelfTest()
@@ -396,6 +457,43 @@ namespace DesktopGlassDock
             var config = new Dictionary<string, object> { { "HideWindowsTaskbar", true }, { "OtherSetting", "保留" } };
             config["HideWindowsTaskbar"] = false;
             checks["关闭隐藏保留其他设置"] = !(bool)config["HideWindowsTaskbar"] && (string)config["OtherSetting"] == "保留";
+            var monitor = new WinRect { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+            var bottom = FullTaskbarBounds(new WinRect { Left = 0, Top = 1078, Right = 1920, Bottom = 1108 }, monitor, null);
+            checks["底部自动隐藏偏移恢复完整高度"] = bottom.Top == 1050 && bottom.Bottom == 1080 && bottom.Right - bottom.Left == 1920;
+            var top = FullTaskbarBounds(new WinRect { Left = 0, Top = -28, Right = 1920, Bottom = 2 }, monitor, null);
+            checks["顶部任务栏保持原边与厚度"] = top.Top == 0 && top.Bottom == 30;
+            var left = FullTaskbarBounds(new WinRect { Left = -38, Top = 0, Right = 2, Bottom = 1080 }, monitor, null);
+            checks["左侧竖栏恢复屏内"] = left.Left == 0 && left.Right == 40 && left.Bottom == 1080;
+            var right = FullTaskbarBounds(new WinRect { Left = 1918, Top = 0, Right = 1958, Bottom = 1080 }, monitor, null);
+            checks["右侧竖栏恢复屏内"] = right.Left == 1880 && right.Right == 1920;
+            var negativeMonitor = new WinRect { Left = -1080, Top = -601, Right = 0, Bottom = 1319 };
+            var secondary = FullTaskbarBounds(new WinRect { Left = -1080, Top = 1317, Right = 0, Bottom = 1367 }, negativeMonitor, null);
+            checks["负坐标副屏按实际像素恢复"] = secondary.Left == -1080 && secondary.Top == 1269 && secondary.Bottom == 1319;
+            var inside = new WinRect { Left = 0, Top = 1030, Right = 1920, Bottom = 1080 };
+            checks["已屏内任务栏不重复移动"] = SameBounds(FullTaskbarBounds(inside, monitor, null), inside);
+            var fallback = FullTaskbarBounds(new WinRect { Left = 0, Top = 1078, Right = 3000, Bottom = 1108 }, monitor, inside);
+            checks["异常尺寸仅按同屏备份兜底"] = fallback.Top == 1030 && fallback.Right == 1920 && fallback.Bottom == 1080;
+            var smaller = FullTaskbarBounds(new WinRect { Left = 0, Top = 718, Right = 1920, Bottom = 748 },
+                new WinRect { Left = 0, Top = 0, Right = 1280, Bottom = 720 }, inside);
+            checks["分辨率变小按当前屏幕调整"] = smaller.Right == 1280 && smaller.Top == 690 && smaller.Bottom == 720;
+
+            // 模拟 fullscreen Start：桌面应用枚举为空，但原生类查询仍返回真实系统任务栏和一个冒名窗口。
+            var desktopOnly = new IntPtr[0];
+            IntPtr realTaskbar = new IntPtr(1), spoofedTaskbar = new IntPtr(2), unrelatedWindow = new IntPtr(3);
+            var fixture = new Dictionary<IntPtr, TaskbarWindow>
+            {
+                { realTaskbar, new TaskbarWindow { Handle = realTaskbar, ClassName = MainClass, ProcessId = 42 } },
+                { spoofedTaskbar, new TaskbarWindow { Handle = spoofedTaskbar, ClassName = MainClass, ProcessId = 99 } },
+                { unrelatedWindow, new TaskbarWindow { Handle = unrelatedWindow, ClassName = "Notepad", ProcessId = 42 } }
+            };
+            Func<string, IEnumerable<IntPtr>> directClasses = name => name == MainClass
+                ? new[] { realTaskbar, spoofedTaskbar, unrelatedWindow, realTaskbar } : new IntPtr[0];
+            List<TaskbarWindow> directResult = ShellTaskbars.CollectTaskbars(directClasses, 42, handle => fixture[handle]);
+            checks["桌面应用枚举为空仍找到原生任务栏"] = desktopOnly.Length == 0 && directResult.Count == 1 && directResult[0].Handle == realTaskbar;
+            checks["原生类同名但非当前Explorer拒绝"] = !directResult.Any(x => x.Handle == spoofedTaskbar);
+            checks["当前Explorer其他窗口不当任务栏操作"] = !directResult.Any(x => x.Handle == unrelatedWindow);
+            checks["没有已验证Explorer不操作任何任务栏"] = ShellTaskbars.CollectTaskbars(directClasses, 0, handle => fixture[handle]).Count == 0;
+
             return new { Passed = checks.Values.All(x => x), Count = checks.Count, Checks = checks };
         }
 
@@ -419,7 +517,20 @@ namespace DesktopGlassDock
             public string MonitorDevice { get; set; }
             public bool Visible { get; set; }
             public TaskbarBounds Bounds { get; set; }
+            public TaskbarBounds MonitorBounds { get; set; }
+            public bool FullyOnScreen { get; set; }
+            public TaskbarComponentState[] TrayComponents { get; set; }
         }
+        public sealed class TaskbarComponentState
+        {
+            public string ClassName { get; set; }
+            public bool Visible { get; set; }
+            public bool Enabled { get; set; }
+            public bool FullyOnScreen { get; set; }
+            public bool InsideTaskbar { get; set; }
+            public TaskbarBounds Bounds { get; set; }
+        }
+
         public sealed class TaskbarRestoreResult
         {
             public bool Success { get; set; }
@@ -436,13 +547,15 @@ namespace DesktopGlassDock
             public string ClassName;
             public string MonitorDevice;
             public bool Visible;
-            public WinRect Rect;
+            public WinRect Rect, MonitorRect;
             public TaskbarWindowState Snapshot()
             {
                 return new TaskbarWindowState
                 {
                     ClassName = ClassName, MonitorDevice = MonitorDevice, Visible = Visible,
-                    Bounds = new TaskbarBounds { Left = Rect.Left, Top = Rect.Top, Right = Rect.Right, Bottom = Rect.Bottom }
+                    Bounds = BoundsOf(Rect), MonitorBounds = BoundsOf(MonitorRect),
+                    FullyOnScreen = InsideMonitor(Rect, MonitorRect),
+                    TrayComponents = ShellTaskbars.TrayComponents(this)
                 };
             }
         }
@@ -472,9 +585,7 @@ namespace DesktopGlassDock
         {
             private static uint trustedProcess;
             private static readonly int Session = Process.GetCurrentProcess().SessionId;
-            private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
             [DllImport("user32.dll")] private static extern IntPtr GetShellWindow();
-            [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
             [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder buffer, int count);
             [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
             [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowVisible(IntPtr window);
@@ -483,6 +594,10 @@ namespace DesktopGlassDock
             [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
             [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool ShowWindowAsync(IntPtr window, int command);
             [DllImport("shell32.dll")] private static extern UIntPtr SHAppBarMessage(uint message, ref AppBarData data);
+
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string title);
+            [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool IsWindowEnabled(IntPtr window);
+            [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
 
             public static bool IsTaskbarClass(string name) { return name == MainClass || name == SecondaryClass; }
             public sealed class RevealHook : IDisposable
@@ -581,26 +696,97 @@ namespace DesktopGlassDock
                     ClassOf(window.Handle) == window.ClassName && IsTaskbarClass(window.ClassName);
             }
 
+            private static IEnumerable<IntPtr> FindClassWindows(string className)
+            {
+                IntPtr previous = IntPtr.Zero;
+                for (int index = 0; index < 128; index++)
+                {
+                    IntPtr current = FindWindowEx(IntPtr.Zero, previous, className, null);
+                    if (current == IntPtr.Zero || current == previous) yield break;
+                    yield return current;
+                    previous = current;
+                }
+            }
+            // 查询策略可替换为纯夹具；UWP 开始菜单打开时不能依赖只枚举桌面应用的 EnumWindows。
+            public static List<TaskbarWindow> CollectTaskbars(Func<string, IEnumerable<IntPtr>> query, uint explorer, Func<IntPtr, TaskbarWindow> inspect)
+            {
+                var windows = new List<TaskbarWindow>();
+                if (explorer == 0) return windows;
+                var seen = new HashSet<IntPtr>();
+                foreach (string expectedClass in new[] { MainClass, SecondaryClass })
+                {
+                    int count = 0;
+                    foreach (IntPtr handle in query(expectedClass))
+                    {
+                        if (count++ >= 128) break;
+                        if (handle == IntPtr.Zero || !seen.Add(handle)) continue;
+                        TaskbarWindow candidate = inspect(handle);
+                        if (candidate != null && candidate.ClassName == expectedClass && candidate.ProcessId == explorer)
+                            windows.Add(candidate);
+                    }
+                }
+                return windows;
+            }
             public static List<TaskbarWindow> Enumerate(bool queryOnly = false)
             {
                 uint explorer = ExplorerProcess(queryOnly);
-                var windows = new List<TaskbarWindow>();
-                if (explorer == 0) return windows;
-                bool success = EnumWindows(delegate(IntPtr handle, IntPtr parameter)
+                return CollectTaskbars(FindClassWindows, explorer, delegate(IntPtr handle)
                 {
                     string name = ClassOf(handle);
                     uint owner;
-                    if (!IsTaskbarClass(name) || GetWindowThreadProcessId(handle, out owner) == 0 || owner != explorer) return true;
+                    if (!IsTaskbarClass(name) || GetWindowThreadProcessId(handle, out owner) == 0 || owner != explorer) return null;
                     WinRect rect;
-                    if (!GetWindowRect(handle, out rect)) return true;
+                    if (!GetWindowRect(handle, out rect)) return null;
                     var monitor = new MonitorInfo { cbSize = (uint)Marshal.SizeOf(typeof(MonitorInfo)) };
-                    if (!GetMonitorInfo(MonitorFromWindow(handle, 2), ref monitor) || String.IsNullOrWhiteSpace(monitor.device)) return true;
-                    windows.Add(new TaskbarWindow { Handle = handle, ProcessId = owner, ClassName = name, MonitorDevice = monitor.device, Visible = IsWindowVisible(handle), Rect = rect });
-                    return true;
-                }, IntPtr.Zero);
-                if (!success) throw new Win32Exception(Marshal.GetLastWin32Error(), "枚举系统任务栏失败。");
-                return windows;
+                    if (!GetMonitorInfo(MonitorFromWindow(handle, 2), ref monitor) || String.IsNullOrWhiteSpace(monitor.device)) return null;
+                    return new TaskbarWindow { Handle = handle, ProcessId = owner, ClassName = name, MonitorDevice = monitor.device, Visible = IsWindowVisible(handle), Rect = rect, MonitorRect = monitor.monitor };
+                });
             }
+
+            public static TaskbarComponentState[] TrayComponents(TaskbarWindow taskbar)
+            {
+                var result = new List<TaskbarComponentState>();
+                var queue = new Queue<IntPtr>();
+                queue.Enqueue(taskbar.Handle);
+                // 仅读取 Explorer 托盘/时钟的实际状态，绝不操作子窗口；兼容主栏和副栏的不同层级。
+                int count = 0;
+                while (queue.Count > 0 && count++ < 256)
+                {
+                    IntPtr parent = queue.Dequeue(), child = IntPtr.Zero;
+                    for (int index = 0; index < 128 && queue.Count < 256; index++)
+                    {
+                        child = FindWindowEx(parent, child, null, null);
+                        if (child == IntPtr.Zero) break;
+                        uint process;
+                        if (GetWindowThreadProcessId(child, out process) == 0 || process != taskbar.ProcessId) continue;
+                        queue.Enqueue(child);
+                        string name = ClassOf(child);
+                        if (name != "TrayNotifyWnd" && name != "TrayClockWClass" && name != "ClockButton") continue;
+                        WinRect rect;
+                        if (!GetWindowRect(child, out rect)) continue;
+                        result.Add(new TaskbarComponentState
+                        {
+                            ClassName = name, Visible = IsWindowVisible(child), Enabled = IsWindowEnabled(child),
+                            FullyOnScreen = InsideMonitor(rect, taskbar.MonitorRect), InsideTaskbar = InsideMonitor(rect, taskbar.Rect),
+                            Bounds = BoundsOf(rect)
+                        });
+                    }
+                }
+                return result.ToArray();
+            }
+            public static void EnsureFullyOnScreen(TaskbarWindow window, TaskbarWindowState saved)
+            {
+                if (!StillOwned(window)) throw new InvalidOperationException("Explorer 任务栏已变化，未移动其他窗口。");
+                WinRect? previous = saved == null || saved.Bounds == null ? (WinRect?)null :
+                    new WinRect { Left = saved.Bounds.Left, Top = saved.Bounds.Top, Right = saved.Bounds.Right, Bottom = saved.Bounds.Bottom };
+                WinRect target = FullTaskbarBounds(window.Rect, window.MonitorRect, previous);
+                if (SameBounds(target, window.Rect)) return;
+                // 保持系统原有 Z 序，不抢开始菜单焦点。只有几何溢出时才异步移动一次。
+                const uint flags = 0x0004 | 0x0010 | 0x0200 | 0x4000; // NOZORDER | NOACTIVATE | NOOWNERZORDER | ASYNCWINDOWPOS
+                if (!SetWindowPos(window.Handle, IntPtr.Zero, target.Left, target.Top, target.Right - target.Left, target.Bottom - target.Top, flags))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "系统拒绝任务栏屏内布局请求。");
+            }
+
             public static uint GetState()
             {
                 var data = new AppBarData { cbSize = (uint)Marshal.SizeOf(typeof(AppBarData)) };
